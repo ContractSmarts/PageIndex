@@ -1,3 +1,5 @@
+# utils.py
+
 import tiktoken
 import openai
 import logging
@@ -16,6 +18,109 @@ import logging
 import yaml
 from pathlib import Path
 from types import SimpleNamespace as config
+import time
+from typing import List, Dict, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Azure OpenAI client
+# ---------------------------------------------------------------------------
+
+def get_llm_client() -> openai.AzureOpenAI:
+    """
+    Return an Azure OpenAI client.
+
+    This project is Azure-only by design.
+    Required environment variables:
+      - AZURE_OPENAI_API_KEY
+      - AZURE_OPENAI_ENDPOINT
+    Optional:
+      - AZURE_OPENAI_API_VERSION (defaults to 2025-01-01-preview)
+    """
+    return openai.AzureOpenAI(
+        api_key=os.environ["AZURE_OPENAI_API_KEY"],
+        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+        api_version=os.environ.get(
+            "AZURE_OPENAI_API_VERSION",
+            "2025-01-01-preview",
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Generic LLM chat completion helper
+# ---------------------------------------------------------------------------
+
+def llm_chat_completion_with_finish_reason(
+    model: str,
+    prompt: str,
+    chat_history: Optional[List[Dict[str, str]]] = None,
+    max_retries: int = 10,
+    temperature: float = 0.0,
+):
+    """
+    Execute a chat completion against an Azure OpenAI deployment and return:
+      - response_text
+      - finish_reason
+
+    Parameters
+    ----------
+    model:
+        Azure OpenAI *deployment name* (e.g. "gpt-4.1")
+    prompt:
+        User prompt for the LLM
+    chat_history:
+        Optional list of prior messages, each like:
+        {"role": "system"|"user"|"assistant", "content": "..."}
+    max_retries:
+        Retry count for transient failures
+    temperature:
+        Sampling temperature (default 0.0 for stability)
+
+    Returns
+    -------
+    (str, str)
+        (response_text, finish_reason)
+    """
+
+    client = get_llm_client()
+
+    messages: List[Dict[str, str]] = []
+    if chat_history:
+        messages.extend(chat_history)
+
+    messages.append({"role": "user", "content": prompt})
+
+    last_exception = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+            )
+
+            choice = response.choices[0]
+            content = choice.message.content
+            finish_reason = choice.finish_reason
+
+            return content, finish_reason
+
+        except Exception as exc:
+            last_exception = exc
+            if attempt >= max_retries:
+                break
+            # simple linear backoff; keep behavior close to original
+            time.sleep(0.5 * attempt)
+
+    # If we get here, retries were exhausted
+    raise RuntimeError(
+        f"LLM chat completion failed after {max_retries} attempts"
+    ) from last_exception
+
+
+# -------------------------------------------
+
 
 CHATGPT_API_KEY = os.getenv("CHATGPT_API_KEY")
 
@@ -26,86 +131,153 @@ def count_tokens(text, model=None):
     tokens = enc.encode(text)
     return len(tokens)
 
-def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
-    max_retries = 10
-    client = openai.OpenAI(api_key=api_key)
-    for i in range(max_retries):
-        try:
-            if chat_history:
-                messages = chat_history
-                messages.append({"role": "user", "content": prompt})
-            else:
-                messages = [{"role": "user", "content": prompt}]
-            
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0,
-            )
-            if response.choices[0].finish_reason == "length":
-                return response.choices[0].message.content, "max_output_reached"
-            else:
-                return response.choices[0].message.content, "finished"
-
-        except Exception as e:
-            print('************* Retrying *************')
-            logging.error(f"Error: {e}")
-            if i < max_retries - 1:
-                time.sleep(1)  # Wait for 1秒 before retrying
-            else:
-                logging.error('Max retries reached for prompt: ' + prompt)
-                return "Error"
 
 
+# below deprecated
+#def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
+#    max_retries = 10
+#    client = openai.OpenAI(api_key=api_key)
+#    for i in range(max_retries):
+#        try:
+#            if chat_history:
+#                messages = chat_history
+#                messages.append({"role": "user", "content": prompt})
+#            else:
+#                messages = [{"role": "user", "content": prompt}]
+#            
+#            response = client.chat.completions.create(
+#                model=model,
+#                messages=messages,
+#                temperature=0,
+#            )
+#            if response.choices[0].finish_reason == "length":
+#                return response.choices[0].message.content, "max_output_reached"
+#            else:
+#                return response.choices[0].message.content, "finished"
+#
+#        except Exception as e:
+#            print('************* Retrying *************')
+#            logging.error(f"Error: {e}")
+#            if i < max_retries - 1:
+#                time.sleep(1)  # Wait for 1秒 before retrying
+#            else:
+#                logging.error('Max retries reached for prompt: ' + prompt)
+#                return "Error"
 
-def ChatGPT_API(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
-    max_retries = 10
-    client = openai.OpenAI(api_key=api_key)
-    for i in range(max_retries):
-        try:
-            if chat_history:
-                messages = chat_history
-                messages.append({"role": "user", "content": prompt})
-            else:
-                messages = [{"role": "user", "content": prompt}]
-            
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0,
-            )
-   
-            return response.choices[0].message.content
-        except Exception as e:
-            print('************* Retrying *************')
-            logging.error(f"Error: {e}")
-            if i < max_retries - 1:
-                time.sleep(1)  # Wait for 1秒 before retrying
-            else:
-                logging.error('Max retries reached for prompt: ' + prompt)
-                return "Error"
-            
+# deprecated
+#def ChatGPT_API(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
+#    max_retries = 10
+#    client = openai.OpenAI(api_key=api_key)
+#    for i in range(max_retries):
+#        try:
+#            if chat_history:
+#                messages = chat_history
+#                messages.append({"role": "user", "content": prompt})
+#            else:
+#                messages = [{"role": "user", "content": prompt}]
+#            
+#            response = client.chat.completions.create(
+#                model=model,
+#                messages=messages,
+#                temperature=0,
+#            )
+#   
+#            return response.choices[0].message.content
+#        except Exception as e:
+#            print('************* Retrying *************')
+#            logging.error(f"Error: {e}")
+#            if i < max_retries - 1:
+#                time.sleep(1)  # Wait for 1秒 before retrying
+#            else:
+#                logging.error('Max retries reached for prompt: ' + prompt)
+#                return "Error"
 
-async def ChatGPT_API_async(model, prompt, api_key=CHATGPT_API_KEY):
-    max_retries = 10
-    messages = [{"role": "user", "content": prompt}]
-    for i in range(max_retries):
-        try:
-            async with openai.AsyncOpenAI(api_key=api_key) as client:
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=0,
-                )
-                return response.choices[0].message.content
-        except Exception as e:
-            print('************* Retrying *************')
-            logging.error(f"Error: {e}")
-            if i < max_retries - 1:
-                await asyncio.sleep(1)  # Wait for 1s before retrying
-            else:
-                logging.error('Max retries reached for prompt: ' + prompt)
-                return "Error"  
+
+
+def llm_chat_completion(
+    model: str,
+    prompt: str,
+    chat_history: Optional[List[Dict[str, str]]] = None,
+    max_retries: int = 10,
+    temperature: float = 0.0,
+) -> str:
+    """
+    Azure-only equivalent of the old ChatGPT_API(...).
+
+    Behavior matches the legacy function:
+      - Returns only the response text
+      - Retries up to max_retries
+      - On exhaustion, returns "Error" (instead of raising)
+    """
+    try:
+        text, _finish = llm_chat_completion_with_finish_reason(
+            model=model,
+            prompt=prompt,
+            chat_history=chat_history,
+            max_retries=max_retries,
+            temperature=temperature,
+        )
+        return text
+    except Exception as e:
+        logging.error("Max retries reached for prompt: %s", prompt)
+        logging.error("Last error: %s", e)
+        return "Error"
+
+
+# ---------------------------------------------------------------------------
+# Provider-agnostic async client factory (Azure today; extend later)
+# ---------------------------------------------------------------------------
+
+def get_async_llm_client(provider: Optional[str] = None):
+    """
+    Return an async LLM client.
+
+    Supported:
+      - provider="azure" (default if AZURE_OPENAI_ENDPOINT is set)
+      - provider="openai" (optional fallback if OPENAI_API_KEY is set)
+
+    Notes:
+      - For Azure: model parameter must be the *deployment name*
+      - For OpenAI: model parameter is the OpenAI model name
+    """
+    provider = (provider or "").strip().lower()
+
+    if provider == "azure" or (not provider and os.getenv("AZURE_OPENAI_ENDPOINT")):
+        return openai.AsyncAzureOpenAI(
+            api_key=os.environ["AZURE_OPENAI_API_KEY"],
+            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"),
+        )
+
+    if provider == "openai" or (not provider and os.getenv("OPENAI_API_KEY")):
+        return openai.AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+    raise RuntimeError(
+        "No LLM provider configured. Set AZURE_OPENAI_* env vars (recommended), "
+        "or set OPENAI_API_KEY, or pass provider explicitly."
+    )
+
+# deprecated
+#async def ChatGPT_API_async(model, prompt, api_key=CHATGPT_API_KEY):
+#    max_retries = 10
+#    messages = [{"role": "user", "content": prompt}]
+#    for i in range(max_retries):
+#        try:
+#            async with openai.AsyncOpenAI(api_key=api_key) as client:
+#                response = await client.chat.completions.create(
+#                    model=model,
+#                    messages=messages,
+#                    temperature=0,
+#                )
+#                return response.choices[0].message.content
+#        except Exception as e:
+#            print('************* Retrying *************')
+#            logging.error(f"Error: {e}")
+#            if i < max_retries - 1:
+#                await asyncio.sleep(1)  # Wait for 1s before retrying
+#            else:
+#                logging.error('Max retries reached for prompt: ' + prompt)
+#                return "Error"  
             
             
 def get_json_content(response):
