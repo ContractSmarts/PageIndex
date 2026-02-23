@@ -26,32 +26,32 @@ import time
 load_dotenv()
 
 
-## MODIFICATION: Backoff function for Azure OpenAI API calls
-## Logic to handle Azure 429s specifically
-#async def call_with_backoff(func, *args, max_retries=7, **kwargs):
-#    for attempt in range(max_retries):
-#        try:
-#            # Check if func is a coroutine or regular function
-#            if asyncio.iscoroutinefunction(func):
-#                return await func(*args, **kwargs)
-#            else:
-#                return func(*args, **kwargs)
-#        except Exception as e:
-#            err_msg = str(e)
-#            # Azure specific 429 detection
-#            if "429" in err_msg or "RateLimitReached" in err_msg:
-#                # Standard exponential backoff: 4, 8, 16, 32...
-#                # Plus jitter to prevent "thundering herd"
-#                wait_time = (2 ** (attempt + 2)) + random.uniform(0, 2)
-#                
-#                # If Azure tells us exactly how long to wait, we listen
-#                # Note: This depends on how the error object is structured in your utils
-#                print(f"⚠️ Rate Limit Hit. Backing off for {wait_time:.1f}s... (Attempt {attempt+1})")
-#                await asyncio.sleep(wait_time)
-#            else:
-#                # If it's a real error (Auth, Logic), don't retry, just fail.
-#                raise e
-#    raise Exception("Resiliency Error: Max retries exceeded.")
+# MODIFICATION: Backoff function for Azure OpenAI API calls
+# Logic to handle Azure 429s specifically
+async def call_with_backoff(func, *args, max_retries=7, **kwargs):
+    for attempt in range(max_retries):
+        try:
+            # Check if func is a coroutine or regular function
+            if asyncio.iscoroutinefunction(func):
+                return await func(*args, **kwargs)
+            else:
+                return func(*args, **kwargs)
+        except Exception as e:
+            err_msg = str(e)
+            # Azure specific 429 detection
+            if "429" in err_msg or "RateLimitReached" in err_msg:
+                # Standard exponential backoff: 4, 8, 16, 32...
+                # Plus jitter to prevent "thundering herd"
+                wait_time = (2 ** (attempt + 2)) + random.uniform(0, 2)
+                
+                # If Azure tells us exactly how long to wait, we listen
+                # Note: This depends on how the error object is structured in your utils
+                print(f"⚠️ Rate Limit Hit. Backing off for {wait_time:.1f}s... (Attempt {attempt+1})")
+                await asyncio.sleep(wait_time)
+            else:
+                # If it's a real error (Auth, Logic), don't retry, just fail.
+                raise e
+    raise Exception("Resiliency Error: Max retries exceeded.")
 
 # MODIFICATION: Azure Environment Variables
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")

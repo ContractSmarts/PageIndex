@@ -1,5 +1,6 @@
 # pageindex/page_index.py
 
+from asyncio import tasks
 import os
 import json
 import copy
@@ -10,6 +11,216 @@ from .utils import *
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Main Pipeline Function after splitting the overall script into stages. 
+# This function orchestrates the entire process, calling each stage in 
+# sequence and handling the flow of data between them. It also checks for 
+# existing intermediate results to allow for resuming or skipping stages as needed.
+
+async def run_pipeline(pdf_path, model):
+    # --- PHASE 1: EXTRACTION ---
+    if not os.path.exists("raw_toc.json"):
+        pages = parse_pdf(pdf_path)
+        raw_results = await stage_1_extract_toc(pages, model, pdf_path)
+    else:
+        print("⏩ raw_toc.json found. Skipping Extraction.")
+        with open("raw_toc.json", "r") as f:
+            raw_results = json.load(f)
+
+    # --- NATURAL STOPPING POINT ---
+    
+    # --- PHASE 2: VERIFICATION ---
+    if not os.path.exists("verified_toc.json"):
+        # This is where we will implement our Hybrid (Heuristic + Batch) logic
+        verified_results = await stage_2_verify_toc(raw_results, pages, model)
+    else:
+        print("⏩ verified_toc.json found. Skipping Verification.")
+
+# Stage 1: Extract TOC and Page Index
+async def stage_1_extract_toc(page_list, model, pdf_name):
+    """
+    Runs the initial and continue loops. 
+    Saves a 'raw_toc.json' and stops.
+    """
+    print(f"🚀 STAGE 1: Extracting TOC from {pdf_name}")
+    
+    # 1. Initial Call
+    toc_data = await generate_toc_init(page_list[0], model)
+    llm_calls = 1
+    
+    # 2. Continuation Loop
+    for i, page_text in enumerate(page_list[1:], start=2):
+        print(f"  🧠 Processing Page {i}/{len(page_list)}...")
+        additional = await generate_toc_continue(toc_data, page_text, model)
+        toc_data.extend(additional)
+        llm_calls += 1
+        
+        # Optional: Breathing room
+        await asyncio.sleep(2)
+
+    # 3. Persistent Save
+    output = {
+        "metadata": {"pdf": pdf_name, "total_pages": len(page_list), "llm_calls": llm_calls},
+        "data": toc_data
+    }
+    
+    with open("raw_toc.json", "w") as f:
+        json.dump(output, f, indent=2)
+    
+    print(f"✅ Stage 1 Complete. {llm_calls} LLM calls made. Results saved to raw_toc.json")
+    return output
+
+# Stage 2: Verify TOC with LLM
+
+async def stage2_original(raw_toc_data, page_list, model, concurrency=5):
+    """
+    Standard Verification: Every item is checked by the LLM.
+    Throttled by semaphore_gather.
+    """
+    print("🔬 STAGE 2 (Original): Starting Full LLM Verification...")
+    items_to_check = raw_toc_data['data']
+    start_time = asyncio.get_event_loop().time()
+    
+    # Prepare tasks
+    tasks = [
+        check_title_appearance(item, page_list, start_index=1, model=model)
+        for item in items_to_check if item.get('physical_index') is not None
+    ]
+    
+    # Execute with throttled concurrency
+    print(f"📡 Sending {len(tasks)} requests to Azure (Semaphore: {concurrency})...")
+    results = await semaphore_gather(tasks, concurrency, return_exceptions=True)
+    
+    # Instrumentation & Logging
+    llm_calls = 0
+    errors = 0
+    correct = 0
+    verified_data = []
+
+    for res in results:
+        if isinstance(res, Exception):
+            errors += 1
+            continue
+        
+        llm_calls += 1
+        if res.get('answer') == 'yes':
+            correct += 1
+        verified_data.append(res)
+
+    duration = asyncio.get_event_loop().time() - start_time
+    stats = {
+        "stage": "Stage 2 Original",
+        "total_items": len(items_to_check),
+        "llm_calls_made": llm_calls,
+        "errors": errors,
+        "accuracy": correct / llm_calls if llm_calls > 0 else 0,
+        "duration_seconds": round(duration, 2)
+    }
+
+    print(f"✅ Stage 2 Original Complete. Accuracy: {stats['accuracy']*100:.1f}%")
+    return {"stats": stats, "data": verified_data}
+
+async def stage2(raw_toc_data, page_list, model, batch_size=20, cooldown=30):
+    """
+    Optimized Verification: 
+    1. Heuristic Exact Match (Deterministic)
+    2. Chunked LLM Batching (Probabilistic)
+    """
+    print("🛡️ STAGE 2 (Optimized): Starting Hybrid Audit...")
+    items = raw_toc_data['data']
+    start_time = asyncio.get_event_loop().time()
+    
+    final_results = []
+    llm_tasks = []
+    heuristic_count = 0
+
+    # --- PHASE 1: DETERMINISTIC HEURISTIC ---
+    for item in items:
+        title = item.get('title', '').strip()
+        p_idx = item.get('physical_index')
+        
+        if p_idx is not None and p_idx < len(page_list):
+            page_text = page_list[p_idx].lower()
+            # Level 1: String search
+            if title.lower() in page_text:
+                final_results.append({
+                    'answer': 'yes', 
+                    'item': item, 
+                    'method': 'deterministic_heuristic'
+                })
+                heuristic_count += 1
+                continue
+        
+        # If Heuristic fails, queue for LLM
+        llm_tasks.append(item)
+
+    print(f"🔎 Heuristics found {heuristic_count}/{len(items)} matches. {len(llm_tasks)} items require AI.")
+
+    # --- PHASE 2: CHUNKED LLM BATCHING ---
+    llm_results_count = 0
+    if llm_tasks:
+        # Split into small groups to manage Azure Rate Limits
+        chunks = [llm_tasks[i:i + batch_size] for i in range(0, len(llm_tasks), batch_size)]
+        
+        for i, chunk in enumerate(chunks):
+            print(f"  🧠 AI Batch {i+1}/{len(chunks)} (Size: {len(chunk)})...")
+            
+            # Create actual coroutines for this chunk
+            batch_tasks = [
+                check_title_appearance(it, page_list, 1, model) 
+                for it in chunk
+            ]
+            
+            batch_res = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            
+            for res in batch_res:
+                if not isinstance(res, Exception):
+                    res['method'] = 'probabilistic_llm'
+                    final_results.append(res)
+                    llm_results_count += 1
+            
+            # Cooldown to refill Azure Token Bucket
+            if i < len(chunks) - 1:
+                print(f"  🕒 Sleeping {cooldown}s...")
+                await asyncio.sleep(cooldown)
+
+    duration = asyncio.get_event_loop().time() - start_time
+    stats = {
+        "stage": "Stage 2 Optimized",
+        "total_items": len(items),
+        "heuristic_matches": heuristic_count,
+        "llm_calls_made": llm_results_count,
+        "duration_seconds": round(duration, 2)
+    }
+
+    return {"stats": stats, "data": final_results}
+
+
+def chunk_list(data, size):
+    return [data[i:i + size] for i in range(0, len(data), size)]
+
+
+
+# MODIFICATION: The following replaces asyncio.gather calls that cause 
+# RateLimitReached errors in Azure. 
+
+async def semaphore_gather(tasks, concurrency_limit=5, return_exceptions=False):
+    """
+    A drop-in replacement for asyncio.gather with a concurrency limit.
+    Ensures 'return_exceptions' can be passed through to prevent batch crashes.
+    """
+    semaphore = asyncio.Semaphore(concurrency_limit)
+
+    async def sem_task(task):
+        async with semaphore:
+            # Small jitter to prevent micro-bursts on the network
+            await asyncio.sleep(random.uniform(0, 0.1))
+            return await task
+
+    # We wrap the tasks and pass the kwargs to the real asyncio.gather
+    return await asyncio.gather(
+        *(sem_task(task) for task in tasks), 
+        return_exceptions=return_exceptions
+    )
 
 ################### check title in page #########################################################
 async def check_title_appearance(item, page_list, start_index=1, model=None):    
@@ -91,7 +302,9 @@ async def check_title_appearance_in_start_concurrent(structure, page_list, model
             tasks.append(check_title_appearance_in_start(item['title'], page_text, model=model, logger=logger))
             valid_items.append(item)
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    #results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await semaphore_gather(tasks, 5, return_exceptions=True)
+    
     for item, result in zip(valid_items, results):
         if isinstance(result, Exception):
             if logger:
@@ -578,9 +791,14 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None):
     logger.info(f'len(group_texts): {len(group_texts)}')
 
     toc_with_page_number= generate_toc_init(group_texts[0], model)
-    for group_text in group_texts[1:]:
+    for i, group_text in enumerate(group_texts[1:], start=2):
         toc_with_page_number_additional = generate_toc_continue(toc_with_page_number, group_text, model)    
         toc_with_page_number.extend(toc_with_page_number_additional)
+        
+        # THE MAGIC LINES
+        print(f"Group {i} of {len(group_texts)} processed. Cooling down for 1.5 seconds...") 
+        time.sleep(1.5)
+
     logger.info(f'generate_toc: {toc_with_page_number}')
 
     toc_with_page_number = convert_physical_index_to_int(toc_with_page_number)
@@ -833,7 +1051,10 @@ async def fix_incorrect_toc(toc_with_page_number, page_list, incorrect_results, 
         process_and_check_item(item)
         for item in incorrect_results
     ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    #results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await semaphore_gather(tasks, 5, return_exceptions=True)
+    
     for item, result in zip(incorrect_results, results):
         if isinstance(result, Exception):
             print(f"Processing item {item} generated an exception: {result}")
@@ -928,7 +1149,8 @@ async def verify_toc(page_list, list_result, start_index=1, N=None, model=None):
         check_title_appearance(item, page_list, start_index, model)
         for item in indexed_sample_list
     ]
-    results = await asyncio.gather(*tasks)
+    #results = await asyncio.gather(*tasks)
+    results = await semaphore_gather(tasks, 5)
     
     # Process results
     correct_count = 0
@@ -946,11 +1168,71 @@ async def verify_toc(page_list, list_result, start_index=1, N=None, model=None):
     return accuracy, incorrect_results
 
 
+################### updated main process #########################################################
 
+async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=None, start_index=1, opt=None, logger=None):
+    print(mode)
+    print(f'start_index: {start_index}')
+
+    # Define the checkpoint path based on the document or a generic name
+    checkpoint_path = "toc_checkpoint.json"
+
+    # --- 1. GENERATION PHASE ---
+    # We only generate if we don't have a local checkpoint to resume from
+    if mode == 'process_toc_with_page_numbers':
+        toc_with_page_number = process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_check_page_num=opt.toc_check_page_num, model=opt.model, logger=logger)
+    elif mode == 'process_toc_no_page_numbers':
+        toc_with_page_number = process_toc_no_page_numbers(toc_content, toc_page_list, page_list, model=opt.model, logger=logger)
+    else:
+        toc_with_page_number = process_no_toc(page_list, start_index=start_index, model=opt.model, logger=logger)
+            
+    toc_with_page_number = [item for item in toc_with_page_number if item.get('physical_index') is not None] 
+    
+    toc_with_page_number = validate_and_truncate_physical_indices(
+        toc_with_page_number, 
+        len(page_list), 
+        start_index=start_index, 
+        logger=logger
+    )
+
+    # --- 2. CHECKPOINT SAVE ---
+    # Save the extracted TOC immediately before the risky verification step
+    try:
+        print(f"💾 Saving intermediate TOC ({len(toc_with_page_number)} items) to {checkpoint_path}...")
+        with open(checkpoint_path, 'w', encoding='utf-8') as f:
+            json.dump(toc_with_page_number, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Warning: Could not save checkpoint: {e}")
+
+    # --- 3. VERIFICATION PHASE (The 'Danger' Zone) ---
+    print("🔍 Entering verification phase...")
+    accuracy, incorrect_results = await verify_toc(page_list, toc_with_page_number, start_index=start_index, model=opt.model)
+        
+    logger.info({
+        'mode': 'process_toc_with_page_numbers',
+        'accuracy': accuracy,
+        'incorrect_results': incorrect_results
+    })
+
+    # --- 4. CORRECTION PHASE ---
+    if accuracy == 1.0 and len(incorrect_results) == 0:
+        return toc_with_page_number
+    if accuracy > 0.6 and len(incorrect_results) > 0:
+        # If verification fails partially, we try to fix it
+        toc_with_page_number, incorrect_results = await fix_incorrect_toc_with_retries(toc_with_page_number, page_list, incorrect_results, start_index=start_index, max_attempts=3, model=opt.model, logger=logger)
+        return toc_with_page_number
+    else:
+        # Recursive fallback logic if accuracy is too low
+        if mode == 'process_toc_with_page_numbers':
+            return await meta_processor(page_list, mode='process_toc_no_page_numbers', toc_content=toc_content, toc_page_list=toc_page_list, start_index=start_index, opt=opt, logger=logger)
+        elif mode == 'process_toc_no_page_numbers':
+            return await meta_processor(page_list, mode='process_no_toc', start_index=start_index, opt=opt, logger=logger)
+        else:
+            raise Exception('Processing failed')
 
 
 ################### main process #########################################################
-async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=None, start_index=1, opt=None, logger=None):
+async def meta_processor_original(page_list, mode=None, toc_content=None, toc_page_list=None, start_index=1, opt=None, logger=None):
     print(mode)
     print(f'start_index: {start_index}')
     
@@ -1016,8 +1298,9 @@ async def process_large_node_recursively(node, page_list, opt=None, logger=None)
             process_large_node_recursively(child_node, page_list, opt, logger=logger)
             for child_node in node['nodes']
         ]
-        await asyncio.gather(*tasks)
-    
+        #await asyncio.gather(*tasks)
+        await semaphore_gather(tasks, 5)
+        
     return node
 
 async def tree_parser(page_list, opt, doc=None, logger=None):
@@ -1052,7 +1335,8 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
         process_large_node_recursively(node, page_list, opt, logger=logger)
         for node in toc_tree
     ]
-    await asyncio.gather(*tasks)
+    #await asyncio.gather(*tasks)
+    await semaphore_gather(tasks, 5)
     
     return toc_tree
 
